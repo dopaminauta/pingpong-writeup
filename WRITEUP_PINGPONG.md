@@ -30,6 +30,8 @@
 
 ## Executive summary
 
+Two forests. One trust. Zero NTLM. A clock that lives in the future. This lab will make you question your SPNs, your certipy flags and your life choices.
+
 PingPong is a dual-forest AD lab: a bidirectional trust between **PING.HTB** (DC1, external entry point) and **PONG.HTB** (DC2, internal only). NTLM is disabled in both domains, so every authentication is pure Kerberos. The lab clock runs about 8 hours ahead of UTC, which forces clock compensation (`faketime`) on every Kerberos operation. RC4 is disabled in PONG (AES256 keys mandatory).
 
 The full chain:
