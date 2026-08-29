@@ -1,0 +1,11 @@
+# Artefactos de la resolución (NO publicar)
+*.ccache
+*.kirbi
+*.pfx
+ntds.dit
+SYSTEM
+SECURITY
+*.b64
+*_gevurah_review.txt
+*_gevurah_agy.txt
+*_gevurah_review2.txt
