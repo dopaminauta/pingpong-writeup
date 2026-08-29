@@ -173,7 +173,7 @@ The "CA Managers" group holds WriteDacl/WriteOwner over the template, so R.Marti
 
 ```bash
 # 1. Modify the template flags (LDAP GSSAPI cross-forest bind as R.Martinelli):
-#    ldap3 modify of CN=SmartcardAuthentication,CN=Certificate Templates,...
+#    ldap3 modify of the SmartcardAuthentication template (DN below)
 #      msPKI-Certificate-Name-Flag = 1   (ENROLLEE_SUPPLIES_SUBJECT)
 #      msPKI-Enrollment-Flag = 0
 
@@ -211,7 +211,7 @@ getST.py -k -no-pass -spn WSMAN/dc1.ping.htb 'ping.htb/administrator'
 
 > Methodological post-mortem: Phase 3 describes the executed attack; this section proves the same vector was visible with systematic enumeration. It is not a duplicate finding, it is a reproducibility check.
 
-1. **NTDS inventory of PONG**: every account with its SID (R.Martinelli = `S-1-5-21-2410575906-...-1124`).
+1. **NTDS inventory of PONG**: every account with its SID (R.Martinelli = `S-1-5-21-2410575906-3092493790-2123333151-1124`).
 2. **DACLs of PING's templates**: `SmartcardAuthentication` has a **WriteDacl/WriteOwner** ACE for the **"CA Managers"** group (RID 2627), a custom group, immediately suspicious.
 3. **"CA Managers" members**: includes the **Foreign Security Principal** of R.Martinelli from PONG.
 4. R.Martinelli's native SID (represented by the FSP) is evaluated normally against the group in PING: he is an effective member of CA Managers → WriteDacl over the template → ESC4 → ESC1 → DA.
