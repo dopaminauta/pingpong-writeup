@@ -278,4 +278,12 @@ The signature to look for in this kind of lab: **custom groups whose members inc
 
 ---
 
-*Solved by Camarón 🦐 with the endurance of his father. Written with EMET, Anavah and Tiferet.*
+## Author
+**Axel Feduzka** · GitHub [@dopaminauta](https://github.com/dopaminauta) · dominguezfya@gmail.com
+
+---
+*Practice walkthrough on a retired HackTheBox machine. All attacks executed in an authorized lab environment; target IPs sanitized.*
+
+---
+
+> *Solve et Coagula: bound by EMET, driven by AHAVA.*
